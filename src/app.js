@@ -1,5 +1,6 @@
 import { calculateUnitEconomics, DEFAULT_INPUTS } from './domain/calculator.js'
 import { COST_PRICE_SCHEMA, OZON_ACCRUALS_SCHEMA, PERIOD_STATUSES } from './domain/importSchema.js'
+import { buildArticleReport, readExcelFile, rowsFromSheet } from './domain/importer.js'
 
 const root = document.querySelector('#root')
 const money = new Intl.NumberFormat('ru-RU', { style: 'currency', currency: 'RUB', maximumFractionDigits: 0 })
@@ -7,8 +8,10 @@ const decimal = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 1 })
 let section = 'calculator'
 let inputs = { ...DEFAULT_INPUTS }
 let periodStatus = 'Закрытый'
-let vatMode = 'included'
 const files = { ozon: null, cost: null }
+const fileStates = { ozon: {}, cost: {} }
+let report = null
+let importError = ''
 
 function layout(content) {
   return `<div class="app-shell">
@@ -64,22 +67,32 @@ function row(name, value, positive = false) {
 
 function uploadCard(key, index, title, description, schema) {
   const file = files[key]
-  return `<article class="upload-card ${file ? 'has-file' : ''}"><div class="upload-top"><span class="file-index">${index}</span><div><h3>${title}</h3><p>${description}</p></div></div>
-    <label class="dropzone"><input data-file="${key}" type="file" accept=".xlsx,.xls"><span class="upload-icon">⇧</span><strong>${file ? file.name : 'Выберите Excel-файл'}</strong><small>${file ? 'Файл выбран · можно заменить' : 'формат .xlsx или .xls'}</small></label>
+  const state = fileStates[key]
+  return `<article class="upload-card ${file ? 'has-file' : ''} ${state.error ? 'has-error' : ''}"><div class="upload-top"><span class="file-index">${index}</span><div><h3>${title}</h3><p>${description}</p></div></div>
+    <label class="dropzone"><input data-file="${key}" type="file" accept=".xlsx"><span class="upload-icon">⇧</span><strong>${file ? escapeHtml(file.name) : 'Выберите Excel-файл'}</strong><small>${state.loading ? 'Читаем файл…' : file ? 'Файл проверен · можно заменить' : 'формат .xlsx'}</small></label>
+    ${state.error ? `<p class="file-error" role="alert">⚠ ${escapeHtml(state.error)}</p>` : ''}
     <div class="schema"><div><span>Лист</span><strong>${schema.sheet}</strong></div><div><span>Строка заголовков</span><strong>${schema.headerRow}</strong></div>${schema.matchKey ? `<div><span>Ключ</span><strong>${schema.matchKey}</strong></div>` : ''}</div>
     ${schema.ignoredSheets ? '<p class="ignore-note">ⓘ Лист «Начисления (2)» будет исключён</p>' : ''}</article>`
 }
 
 function pnlPage() {
-  return layout(`${header('Фактические данные', 'Факт P&amp;L Ozon', 'Подготовьте отчёты закрытого периода для сверки с учётной моделью.', 'Импорт · этап 1')}
+  return layout(`${header('Фактические данные', 'Факт P&amp;L Ozon', 'Загрузите два Excel-файла: обработка полностью выполняется в вашем браузере.', 'Локальный импорт')}
     <div class="period-bar card"><div><label>Отчётный период</label><div class="date-range"><span>01.08.2026</span><i>—</i><span>31.08.2026</span></div></div><div><label>Статус периода</label><div class="segmented">${PERIOD_STATUSES.map(item => `<button data-status="${item}" class="${periodStatus === item ? 'selected' : ''}">${item === 'Закрытый' ? '▣ ' : ''}${item}</button>`).join('')}</div></div><div class="source-pill"><span>Источник данных</span><strong>▤ Excel-отчёт Ozon</strong></div></div>
     <section class="upload-section"><div class="section-title"><span class="step">01</span><div><h2>Загрузите исходные файлы</h2><p>Реальные данные не сохраняются в репозитории</p></div></div><div class="upload-grid">${uploadCard('ozon', 1, 'Отчёт Ozon по начислениям', 'Основной источник выручки и расходов', OZON_ACCRUALS_SCHEMA)}${uploadCard('cost', 2, 'Справочник себестоимости', 'Сопоставление по артикулу продавца', COST_PRICE_SCHEMA)}</div></section>
-    <section class="card vat-card"><div class="section-title"><span class="step">02</span><div><h2>Настройка себестоимости и НДС</h2><p>Единый режим будет применён ко всем значениям «СЕБЕС (руб)»</p></div></div><div class="vat-content"><div class="vat-choice">${vatChoice('included', 'Себестоимость указана с НДС', 'Значение в файле уже включает налог')}${vatChoice('excluded', 'Себестоимость указана без НДС', 'Налог не включён в значение файла')}</div><div class="vat-rate"><label>Ставка НДС себестоимости</label><div><input value="22" readonly><span>%</span></div><small>Настройка фиксируется вместе с периодом</small></div></div><div class="warning">ⓘ <span><strong>Суммы не смешиваются автоматически.</strong> Режим НДС будет явно отображаться в расчёте и экспорте.</span></div></section>
-    <div class="future-note"><div class="future-icon">✓</div><div><span>Архитектура источников</span><strong>Готово к подключению Ozon API</strong><p>В будущем здесь появится второй источник только для чтения. Управление ценами, остатками, товарами и рекламой не предусмотрено.</p></div><em>Позже</em></div>`)
+    <section class="import-actions"><div><strong>Себестоимость используется без корректировки НДС</strong><span>Берём значение «СЕБЕС (руб)» ровно из справочника.</span></div><button id="run-import" ${files.ozon && files.cost && !fileStates.ozon.loading && !fileStates.cost.loading ? '' : 'disabled'}>Сформировать отчёт</button></section>
+    ${importError ? `<div class="global-error" role="alert">⚠ ${escapeHtml(importError)}</div>` : ''}
+    ${report ? reportView(report) : ''}`)
 }
 
-function vatChoice(value, title, note) {
-  return `<label class="${vatMode === value ? 'checked' : ''}"><input data-vat="${value}" type="radio" name="vat" ${vatMode === value ? 'checked' : ''}><span><strong>${title}</strong><small>${note}</small></span></label>`
+function reportView(rows) {
+  const missing = rows.filter(row => row.missingCost)
+  return `<section class="report-section"><div class="section-title"><span class="step">02</span><div><h2>Результат по артикулам</h2><p>${rows.length} товаров · ${missing.length} без себестоимости</p></div></div>
+    <div class="report-table card"><table><thead><tr><th>Артикул</th><th>SKU и название</th><th>Количество</th><th>Продажи</th><th>Начисления Ozon</th><th>Себестоимость</th><th>Прибыль</th><th>Рентабельность</th><th>Статус</th></tr></thead><tbody>${rows.map(item => `<tr class="${item.missingCost ? 'missing-row' : ''}"><td><strong>${escapeHtml(item.article)}</strong></td><td><strong>${escapeHtml(item.sku || '—')}</strong><small>${escapeHtml(item.name || 'Без названия')}</small></td><td>${decimal.format(item.quantity)}</td><td>${money.format(item.sales)}</td><td>${money.format(item.accruals)}</td><td>${item.cost == null ? '—' : money.format(item.cost)}</td><td class="${item.profit != null && item.profit >= 0 ? 'profit' : 'loss'}">${item.profit == null ? '—' : money.format(item.profit)}</td><td>${item.profitability == null ? '—' : `${decimal.format(item.profitability)}%`}</td><td><span class="status ${item.missingCost ? 'missing' : 'found'}">${item.missingCost ? '⚠ Не найдена' : '✓ Найдена'}</span></td></tr>`).join('')}</tbody></table></div>
+    ${missing.length ? `<aside class="missing-list"><h3>Товары без найденной себестоимости</h3><p>Добавьте эти артикулы на лист «OZON» и загрузите справочник повторно.</p><div>${missing.map(item => `<span>${escapeHtml(item.article)}${item.name ? ` · ${escapeHtml(item.name)}` : ''}</span>`).join('')}</div></aside>` : '<div class="all-found">✓ Себестоимость найдена для всех товаров.</div>'}</section>`
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char])
 }
 
 function render() {
@@ -88,8 +101,29 @@ function render() {
   root.querySelectorAll('[data-input]').forEach(input => input.addEventListener('change', () => { inputs[input.dataset.input] = input.value; render() }))
   root.querySelector('#reset')?.addEventListener('click', () => { inputs = { ...DEFAULT_INPUTS }; render() })
   root.querySelectorAll('[data-status]').forEach(button => button.addEventListener('click', () => { periodStatus = button.dataset.status; render() }))
-  root.querySelectorAll('[data-vat]').forEach(input => input.addEventListener('change', () => { vatMode = input.dataset.vat; render() }))
-  root.querySelectorAll('[data-file]').forEach(input => input.addEventListener('change', () => { files[input.dataset.file] = input.files[0] || null; render() }))
+  root.querySelectorAll('[data-file]').forEach(input => input.addEventListener('change', async () => {
+    const key = input.dataset.file
+    const file = input.files[0] || null
+    files[key] = file
+    fileStates[key] = file ? { loading: true } : {}
+    report = null
+    importError = ''
+    render()
+    if (!file) return
+    try {
+      const workbook = await readExcelFile(file)
+      rowsFromSheet(workbook, key === 'ozon' ? OZON_ACCRUALS_SCHEMA : COST_PRICE_SCHEMA)
+      fileStates[key] = { workbook }
+    } catch (error) { files[key] = null; fileStates[key] = { error: error.message } }
+    render()
+  }))
+  root.querySelector('#run-import')?.addEventListener('click', () => {
+    try {
+      report = buildArticleReport(fileStates.ozon.workbook, fileStates.cost.workbook)
+      importError = report.length ? '' : 'В отчёте нет строк с заполненным артикулом.'
+    } catch (error) { report = null; importError = error.message }
+    render()
+  })
 }
 
 render()

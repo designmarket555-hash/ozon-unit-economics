@@ -7,7 +7,7 @@
     "dev": "node scripts/serve.js",
     "build": "node scripts/build.js",
     "test": "node --test",
-    "lint": "node --check src/app.js && node --check src/domain/calculator.js"
+    "lint": "node --check src/app.js && node --check src/domain/calculator.js && node --check src/domain/importer.js"
   },
   "dependencies": {},
   "devDependencies": {}
