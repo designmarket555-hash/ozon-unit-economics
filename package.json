@@ -1,0 +1,14 @@
+{
+  "name": "ozon-unit-economics",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/serve.js",
+    "build": "node scripts/build.js",
+    "test": "node --test",
+    "lint": "node --check src/app.js && node --check src/domain/calculator.js"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}
