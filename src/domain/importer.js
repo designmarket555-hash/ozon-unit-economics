@@ -46,10 +46,13 @@ export function buildArticleReport(accrualWorkbook, costWorkbook) {
   accruals.forEach(row => {
     const article = normalizeArticle(row['Артикул'])
     if (!article) return
-    const item = result.get(article) || { article, sku: '', name: '', quantity: 0, sales: 0, accruals: 0 }
+    const item = result.get(article) || { article, sku: '', name: '', quantity: 0, sales: 0, accruals: 0, commissionPercent: null }
     const quantity = number(row['Количество'])
     item.sku ||= String(row.SKU ?? '').trim()
     item.name ||= String(row['Название товара'] ?? '').trim()
+    if (item.commissionPercent == null && row['Комиссия Ozon, %'] !== '' && row['Комиссия Ozon, %'] != null) {
+      item.commissionPercent = number(row['Комиссия Ozon, %'])
+    }
     item.quantity += quantity
     item.sales += number(row['Цена продавца']) * quantity
     item.accruals += number(row['Сумма итого, руб.'])

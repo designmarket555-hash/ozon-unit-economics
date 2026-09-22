@@ -22,7 +22,7 @@ describe('Excel import domain', () => {
     const result = buildArticleReport(accrualWorkbook, costWorkbook)
     assert.deepEqual(result[0], {
       article: 'TEST-100', sku: '900001', name: 'Тестовый товар А', quantity: 2,
-      sales: 2000, accruals: 1400, cost: 600, profit: 800,
+      sales: 2000, accruals: 1400, commissionPercent: 15, cost: 600, profit: 800,
       profitability: 800 / 600 * 100, missingCost: false,
     })
   })
@@ -35,9 +35,23 @@ describe('Excel import domain', () => {
     assert.equal(item.profit, null)
   })
 
+  it('imports an Ozon report without the optional commission percentage', () => {
+    const commissionIndex = accrualHeaders.indexOf('Комиссия Ozon, %')
+    const workbookWithoutCommission = {
+      Начисления: accrualWorkbook.Начисления.map((row, index) =>
+        index === 0 ? [...row] : row.filter((_, column) => column !== commissionIndex)),
+    }
+
+    const item = buildArticleReport(workbookWithoutCommission, costWorkbook)[0]
+    assert.equal(item.commissionPercent, null)
+    assert.equal(item.accruals, 1400)
+    assert.equal(item.profit, 800)
+  })
+
   it('reports a missing sheet and missing columns clearly', () => {
     assert.throws(() => rowsFromSheet({}, OZON_ACCRUALS_SCHEMA), error => error instanceof ImportError && error.code === 'MISSING_SHEET')
     assert.throws(() => rowsFromSheet({ Начисления: [[], ['Артикул'], ['TEST']] }, OZON_ACCRUALS_SCHEMA), error => error.code === 'MISSING_COLUMNS' && error.message.includes('ID начисления'))
+    assert.throws(() => rowsFromSheet({ Начисления: [[], accrualHeaders.filter(header => header !== 'Сумма итого, руб.'), ['TEST']] }, OZON_ACCRUALS_SCHEMA), error => error.code === 'MISSING_COLUMNS' && error.message.includes('Сумма итого, руб.'))
   })
 
   it('reports a sheet without data rows as empty', () => {
