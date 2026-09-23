@@ -1,6 +1,6 @@
 import { calculateUnitEconomics, DEFAULT_INPUTS } from './domain/calculator.js'
 import { COST_PRICE_SCHEMA, OZON_ACCRUALS_SCHEMA, PERIOD_STATUSES } from './domain/importSchema.js'
-import { buildArticleReport, readExcelFile, rowsFromSheet } from './domain/importer.js'
+import { buildArticleReport, readCostReference, readExcelFile, rowsFromSheet } from './domain/importer.js'
 
 const root = document.querySelector('#root')
 const money = new Intl.NumberFormat('ru-RU', { style: 'currency', currency: 'RUB', minimumFractionDigits: 2, maximumFractionDigits: 2 })
@@ -71,7 +71,8 @@ function uploadCard(key, index, title, description, schema) {
   return `<article class="upload-card ${file ? 'has-file' : ''} ${state.error ? 'has-error' : ''}"><div class="upload-top"><span class="file-index">${index}</span><div><h3>${title}</h3><p>${description}</p></div></div>
     <label class="dropzone"><input data-file="${key}" type="file" accept=".xlsx"><span class="upload-icon">⇧</span><strong>${file ? escapeHtml(file.name) : 'Выберите Excel-файл'}</strong><small>${state.loading ? 'Читаем файл…' : file ? 'Файл проверен · можно заменить' : 'формат .xlsx'}</small></label>
     ${state.error ? `<p class="file-error" role="alert">⚠ ${escapeHtml(state.error)}</p>` : ''}
-    <div class="schema"><div><span>Лист</span><strong>${key === 'ozon' ? 'Определяется по содержимому' : schema.sheet}</strong></div><div><span>Строка заголовков</span><strong>${key === 'ozon' ? 'Первые 20 строк' : `Первые 20 строк`}</strong></div>${schema.matchKey ? `<div><span>Ключ</span><strong>${schema.matchKey}</strong></div>` : ''}</div></article>`
+    ${state.costImport ? `<div class="import-summary"><strong>Лист «${escapeHtml(state.costImport.sheetName)}», заголовки: строка ${state.costImport.headerRow}</strong><span>${state.costImport.articleCount} артикулов · ${state.costImport.skippedEmptyRows} пустых строк пропущено · ${state.costImport.invalidCostCount} без корректной себестоимости · ${state.costImport.conflictCount} конфликтующих дублей</span></div>` : ''}
+    <div class="schema"><div><span>Лист</span><strong>Определяется по содержимому</strong></div><div><span>Строка заголовков</span><strong>${key === 'ozon' ? 'Первые 20 строк' : 'Первые 30 строк'}</strong></div>${schema.matchKey ? `<div><span>Ключ</span><strong>${schema.matchKey}</strong></div>` : ''}</div></article>`
 }
 
 function pnlPage() {
@@ -97,7 +98,7 @@ function reportView(report) {
     ${report.newCategoryDetails?.length ? `<div class="section-title"><span class="step">!</span><div><h2>Новые категории Ozon</h2><p>Суммы сохранены отдельно и уже входят в общий итог</p></div></div><div class="service-summary card">${report.newCategoryDetails.map(item => `<div><span>${escapeHtml(item.label)}</span><strong>${money.format(item.amount)}</strong></div>`).join('')}</div>` : ''}
     <div class="section-title article-heading"><span class="step">03</span><div><h2>Результат по артикулам</h2><p>${rows.filter(row => !row.unassigned).length} товаров · ${missing.length} без себестоимости · продано ${decimal.format(totals.quantity)} ед.</p></div></div>
     <div class="report-table card"><table><thead><tr><th>Артикул</th><th>SKU и название</th><th>Количество</th><th>Выручка ВД</th><th>Вознаграждение Ozon</th><th>Прочие расходы Ozon</th><th>Начисления после расходов Ozon</th><th>Себестоимость</th><th>ВП</th><th>Рентабельность ВП</th><th>Статус</th></tr></thead><tbody>${rows.map(item => `<tr class="${item.missingCost ? 'missing-row' : ''}"><td><strong>${item.unassigned ? '—' : escapeHtml(item.article)}</strong></td><td><strong>${escapeHtml(item.sku || '—')}</strong><small>${escapeHtml(item.name || 'Без названия')}</small></td><td>${decimal.format(item.quantity)}</td><td>${money.format(item.revenue)}</td><td>${money.format(item.ozonReward)}</td><td>${money.format(item.otherOzonExpenses)}</td><td>${money.format(item.accruals)}</td><td>${item.cost == null ? '—' : money.format(item.cost)}</td><td class="${item.profit != null && item.profit >= 0 ? 'profit' : 'loss'}">${item.profit == null ? '—' : money.format(item.profit)}</td><td>${item.profitability == null ? '—' : `${decimal.format(item.profitability)}%`}</td><td>${item.unassigned ? '<span class="status">Не распределяется</span>' : `<span class="status ${item.missingCost ? 'missing' : 'found'}">${item.missingCost ? '⚠ Не найдена' : '✓ Найдена'}</span>`}</td></tr>`).join('')}</tbody></table></div>
-    ${missing.length ? `<aside class="missing-list"><h3>Товары без найденной себестоимости</h3><p>Добавьте эти артикулы на лист «OZON» и загрузите справочник повторно.</p><div>${missing.map(item => `<span>${escapeHtml(item.article)}${item.name ? ` · ${escapeHtml(item.name)}` : ''}</span>`).join('')}</div></aside>` : '<div class="all-found">✓ Себестоимость найдена для всех товаров.</div>'}</section>`
+    ${missing.length ? `<aside class="missing-list"><h3>Себестоимость не найдена или содержит ошибку</h3><p>Исправьте значения в справочнике и загрузите его повторно.</p><div>${missing.map(item => { const issue = report.costImport?.issues.find(found => found.article === item.article); return `<span>${escapeHtml(item.article)}${item.name ? ` · ${escapeHtml(item.name)}` : ''}${issue ? ` · ${escapeHtml(issue.address)}: ${escapeHtml(issue.error)}` : ''}</span>` }).join('')}</div></aside>` : '<div class="all-found">✓ Себестоимость найдена для всех товаров.</div>'}</section>`
 }
 
 function escapeHtml(value) {
@@ -121,8 +122,9 @@ function render() {
     if (!file) return
     try {
       const workbook = await readExcelFile(file)
-      rowsFromSheet(workbook, key === 'ozon' ? OZON_ACCRUALS_SCHEMA : COST_PRICE_SCHEMA)
-      fileStates[key] = { workbook }
+      const costImport = key === 'cost' ? readCostReference(workbook).summary : null
+      if (key === 'ozon') rowsFromSheet(workbook, OZON_ACCRUALS_SCHEMA)
+      fileStates[key] = { workbook, costImport }
     } catch (error) { files[key] = null; fileStates[key] = { error: error.message } }
     render()
   }))

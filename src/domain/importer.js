@@ -27,11 +27,40 @@ export function rowsFromSheet(workbook, schema) {
   return rows.map(row => Object.fromEntries(headers.map((header, index) => [header, row[index] ?? ''])))
 }
 
+export function readCostReference(workbook) {
+  const table = locateTable(workbook, COST_PRICE_SCHEMA)
+  const articleColumn = table.columns.get('article')
+  const costColumn = table.columns.get('cost')
+  const costs = new Map(), issues = [], conflicts = [], articles = new Set()
+  let skippedEmptyRows = 0
+  for (let index = table.headerIndex + 1; index < table.sheet.length; index++) {
+    const row = table.sheet[index] || []
+    const article = normalizeArticle(row[articleColumn])
+    if (!article) { if (row.some(cell => cell !== '' && cell != null)) skippedEmptyRows++; continue }
+    articles.add(article)
+    const cell = row[costColumn]
+    const parsed = strictNumber(cell)
+    if (parsed == null) {
+      issues.push({ article, address: cell?.address || `${columnName(costColumn)}${index + 1}`, error: cell?.xlsxError || (cleanText(cell) || 'пустая ячейка') })
+      continue
+    }
+    if (costs.has(article) && costs.get(article) !== parsed) {
+      conflicts.push({ article, values: [costs.get(article), parsed], address: `${columnName(costColumn)}${index + 1}` })
+      continue
+    }
+    costs.set(article, parsed)
+  }
+  return {
+    costs, issues, conflicts,
+    summary: { sheetName: table.sheetName, headerRow: table.headerIndex + 1, articleCount: articles.size, skippedEmptyRows, invalidCostCount: issues.length, conflictCount: conflicts.length },
+  }
+}
+
 export function buildArticleReport(accrualWorkbook, costWorkbook) {
   const accrualTable = locateTable(accrualWorkbook, OZON_ACCRUALS_SCHEMA)
   const accruals = rowsFromSheet(accrualWorkbook, OZON_ACCRUALS_SCHEMA)
-  const costs = rowsFromSheet(costWorkbook, COST_PRICE_SCHEMA)
-  const costByArticle = new Map(costs.map(row => [normalizeArticle(value(row, COST_PRICE_SCHEMA.matchKey)), number(value(row, COST_PRICE_SCHEMA.costField))]).filter(([article]) => article))
+  const costReference = readCostReference(costWorkbook)
+  const costByArticle = costReference.costs
   const result = new Map(), serviceGroups = new Map(), unknownGroups = new Set(), unknownTypes = new Set(), categoryAmounts = new Map()
   for (const row of accruals) {
     const article = normalizeArticle(value(row, 'Артикул'))
@@ -63,7 +92,8 @@ export function buildArticleReport(accrualWorkbook, costWorkbook) {
   const warnings = [...unknownGroups].map(group => `Обнаружена новая группа услуг Ozon: «${group}». Сумма включена в общий итог.`)
   warnings.push(...[...unknownTypes].map(type => `Обнаружен новый тип начисления Ozon: «${type}». Сумма включена в общий итог.`))
   const newCategoryDetails = [...categoryAmounts].filter(([label]) => [...unknownGroups].some(group => label.startsWith(`${group} —`)) || [...unknownTypes].some(type => label.endsWith(`— ${type}`))).map(([label, amount]) => ({ label, amount }))
-  return { period: extractPeriod(accrualTable.sheet, accrualTable.headerIndex), serviceGroups: Object.fromEntries(serviceGroups), unknownGroups: [...unknownGroups], unknownTypes: [...unknownTypes], newCategoryDetails, warnings, totals: { quantity: articles.reduce((sum, item) => sum + item.quantity, 0), revenue, accruals: accrualsTotal, cost, profit, profitability: revenue ? profit / revenue * 100 : 0, revenueWithoutVat: revenue / 1.22, profitWithoutVat: profit / 1.22 }, articles }
+  warnings.push(...costReference.conflicts.map(item => `Конфликт себестоимости для артикула «${item.article}»: ${item.values.join(' и ')} (${item.address}).`))
+  return { period: extractPeriod(accrualTable.sheet, accrualTable.headerIndex), serviceGroups: Object.fromEntries(serviceGroups), unknownGroups: [...unknownGroups], unknownTypes: [...unknownTypes], newCategoryDetails, warnings, costImport: { ...costReference.summary, issues: costReference.issues, conflicts: costReference.conflicts }, totals: { quantity: articles.reduce((sum, item) => sum + item.quantity, 0), revenue, accruals: accrualsTotal, cost, profit, profitability: revenue ? profit / revenue * 100 : 0, revenueWithoutVat: revenue / 1.22, profitWithoutVat: profit / 1.22 }, articles }
 }
 
 function locateTable(workbook, schema) {
@@ -72,12 +102,13 @@ function locateTable(workbook, schema) {
   const preferred = entries.filter(([name]) => equalText(name, schema.sheet))
   const ordered = [...preferred, ...entries.filter(entry => !preferred.includes(entry))]
   let best = null
-  for (const [sheetName, sheet] of ordered) for (let index = 0; index < Math.min(20, sheet.length); index++) {
-    const headers = (sheet[index] || []).map(cleanText), normalized = new Map(headers.map((header, column) => [normalizeText(header), column]))
+  for (const [sheetName, sheet] of ordered) for (let index = 0; index < Math.min(schema === COST_PRICE_SCHEMA ? 30 : 20, sheet.length); index++) {
+    const headers = Array.from(sheet[index] || [], cleanText), normalized = new Map(headers.map((header, column) => [normalizeText(header), column]))
     const required = schema.fields || [schema.matchKey, schema.costField]
-    const matched = required.filter(header => normalized.has(normalizeText(header))).length
+    const columns = schema === COST_PRICE_SCHEMA ? costColumns(headers) : null
+    const matched = schema === COST_PRICE_SCHEMA ? columns.size : required.filter(header => normalized.has(normalizeText(header))).length
     if (!best || matched > best.matched) best = { sheetName, index, headers, matched, required }
-    if (matched === required.length) return { sheet, sheetName, headerIndex: index, headers }
+    if (matched === required.length) return { sheet, sheetName, headerIndex: index, headers, columns }
   }
   if (!entries.length) throw new ImportError('В книге нет листов.', 'EMPTY_FILE')
   const missing = (best?.required || schema.fields || []).filter(header => !best?.headers.some(found => normalizeText(found) === normalizeText(header)))
@@ -86,9 +117,20 @@ function locateTable(workbook, schema) {
   throw new ImportError(`Не найдена таблица с нужными заголовками. Найденные листы: ${sheets}. ${similar} Отсутствуют обязательные колонки: ${missing.join(', ')}.`, 'MISSING_COLUMNS')
 }
 
+function costColumns(headers) {
+  const columns = new Map()
+  headers.forEach((header, index) => {
+    const normalized = normalizeText(header).replace(/\s*,\s*/g, ', ')
+    if (normalized === 'артикул') columns.set('article', index)
+    if (['себес (руб)', 'себес', 'себестоимость', 'себестоимость, руб'].includes(normalized)) columns.set('cost', index)
+  })
+  return columns
+}
+
 function value(row, expected) { const key = Object.keys(row).find(header => normalizeText(header) === normalizeText(expected)); return key == null ? '' : row[key] }
 function extractPeriod(sheet, headerIndex) { return sheet.slice(0, headerIndex).flat().map(cleanText).filter(Boolean).join(' · ') || 'Период не указан' }
 function normalizeArticle(value) { const text = cleanText(value); return text === '0' ? '' : text }
+function strictNumber(value) { if (typeof value === 'number') return Number.isFinite(value) ? value : null; if (value && typeof value === 'object') return null; const text = String(value ?? '').replace(/\s/g, '').replace(',', '.'); if (!text) return null; const parsed = Number(text); return Number.isFinite(parsed) ? parsed : null }
 function number(value) { if (typeof value === 'number') return Number.isFinite(value) ? value : 0; const parsed = Number(String(value ?? '').replace(/\s/g, '').replace(',', '.')); return Number.isFinite(parsed) ? parsed : 0 }
 function cleanText(value) { return decodeXml(String(value ?? '')).replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim() }
 function normalizeText(value) { return cleanText(value).toLocaleLowerCase('ru').replace(/ё/g, 'е').replace(/[.]+$/g, '').trim() }
@@ -132,6 +174,7 @@ function parseSheet(root, shared) {
       else if (type === 'str') row[column] = cleanText(raw)
       else if (type === 'n' || !cell.attrs.t) row[column] = raw === '' ? '' : Number(raw)
       else if (type === 'b') row[column] = raw === '1'
+      else if (type === 'e') row[column] = { xlsxError: cleanText(raw) || 'ошибка Excel', address: cell.attrs.r || `${columnName(column)}${rowIndex + 1}` }
       else throw new ImportError(`Неподдерживаемый тип ячейки «${type}».`, 'UNSUPPORTED_CELL_TYPE')
     }
     rows[rowIndex] = row
@@ -192,6 +235,7 @@ async function unzip(buffer) {
 }
 function positiveIndex(value, fallback) { const parsed = Number(value); return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback }
 function columnIndex(reference) { const letters = reference.match(/^[A-Z]+/i)?.[0]; if (!letters) return 0; return [...letters.toUpperCase()].reduce((total, char) => total * 26 + char.charCodeAt(0) - 64, 0) - 1 }
+function columnName(index) { let result = ''; for (let value = index + 1; value; value = Math.floor((value - 1) / 26)) result = String.fromCharCode(65 + (value - 1) % 26) + result; return result }
 function decodeXml(value) { return String(value).replace(/&(?:#(\d+)|#x([\da-f]+)|amp|lt|gt|quot|apos);/gi, (entity, decimal, hex) => decimal ? String.fromCodePoint(Number(decimal)) : hex ? String.fromCodePoint(parseInt(hex, 16)) : ({ '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&apos;': "'" })[entity.toLowerCase()]) }
 function textFile(files, path) { const value = files.get(normalizePath(path)); if (!value) throw new Error(`отсутствует ${path}`); return new TextDecoder().decode(value) }
 function normalizePath(path) { const parts = []; path.replace(/\\/g, '/').split('/').forEach(part => part === '..' ? parts.pop() : part !== '.' && part && parts.push(part)); return parts.join('/') }
