@@ -43,27 +43,44 @@ export function buildArticleReport(accrualWorkbook, costWorkbook) {
     if (article) costByArticle.set(article, number(row[COST_PRICE_SCHEMA.costField]))
   })
   const result = new Map()
+  const serviceGroups = new Map()
   accruals.forEach(row => {
     const article = normalizeArticle(row['Артикул'])
-    if (!article) return
-    const item = result.get(article) || { article, sku: '', name: '', quantity: 0, sales: 0, accruals: 0, commissionPercent: null }
-    const quantity = number(row['Количество'])
+    const amount = number(row['Сумма итого, руб.'])
+    const group = String(row['Группа услуг'] ?? '').trim()
+    serviceGroups.set(group, (serviceGroups.get(group) || 0) + amount)
+    const key = article || '0'
+    const item = result.get(key) || { article: key, sku: '', name: '', quantity: 0, revenue: 0, ozonReward: 0, otherOzonExpenses: 0, accruals: 0 }
     item.sku ||= String(row.SKU ?? '').trim()
     item.name ||= String(row['Название товара'] ?? '').trim()
-    if (item.commissionPercent == null && row['Комиссия Ozon, %'] !== '' && row['Комиссия Ozon, %'] != null) {
-      item.commissionPercent = number(row['Комиссия Ozon, %'])
-    }
-    item.quantity += quantity
-    item.sales += number(row['Цена продавца']) * quantity
-    item.accruals += number(row['Сумма итого, руб.'])
-    result.set(article, item)
+    if (group === 'Продажи' && String(row['Тип начисления'] ?? '').trim() === 'Выручка') item.quantity += number(row['Количество'])
+    if (group === 'Продажи') item.revenue += amount
+    else if (group === 'Вознаграждение Ozon') item.ozonReward += amount
+    else item.otherOzonExpenses += amount
+    item.accruals += amount
+    result.set(key, item)
   })
-  return [...result.values()].map(item => {
+  const articles = [...result.values()].map(item => {
+    if (item.article === '0') return { ...item, name: 'Общие расходы без артикула', cost: null, profit: null, profitability: null, missingCost: false, unassigned: true }
     const hasCost = costByArticle.has(item.article)
     const cost = hasCost ? costByArticle.get(item.article) * item.quantity : null
     const profit = hasCost ? item.accruals - cost : null
-    return { ...item, cost, profit, profitability: hasCost && cost ? profit / cost * 100 : null, missingCost: !hasCost }
+    return { ...item, cost, profit, profitability: hasCost && item.revenue ? profit / item.revenue * 100 : null, missingCost: !hasCost, unassigned: false }
   }).sort((a, b) => a.article.localeCompare(b.article, 'ru', { numeric: true }))
+  const revenue = serviceGroups.get('Продажи') || 0
+  const accrualsTotal = [...serviceGroups.values()].reduce((sum, value) => sum + value, 0)
+  const cost = articles.reduce((sum, item) => sum + (item.cost || 0), 0)
+  const profit = accrualsTotal - cost
+  return {
+    period: extractPeriod(accrualWorkbook[OZON_ACCRUALS_SCHEMA.sheet][0]),
+    serviceGroups: Object.fromEntries(serviceGroups),
+    totals: { quantity: articles.reduce((sum, item) => sum + item.quantity, 0), revenue, accruals: accrualsTotal, cost, profit, profitability: revenue ? profit / revenue * 100 : 0, revenueWithoutVat: revenue / 1.22, profitWithoutVat: profit / 1.22 },
+    articles,
+  }
+}
+
+function extractPeriod(firstRow) {
+  return (firstRow || []).map(value => String(value ?? '').trim()).filter(Boolean).join(' · ') || 'Период не указан'
 }
 
 function normalizeArticle(value) {

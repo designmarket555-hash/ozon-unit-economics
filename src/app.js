@@ -3,7 +3,7 @@ import { COST_PRICE_SCHEMA, OZON_ACCRUALS_SCHEMA, PERIOD_STATUSES } from './doma
 import { buildArticleReport, readExcelFile, rowsFromSheet } from './domain/importer.js'
 
 const root = document.querySelector('#root')
-const money = new Intl.NumberFormat('ru-RU', { style: 'currency', currency: 'RUB', maximumFractionDigits: 0 })
+const money = new Intl.NumberFormat('ru-RU', { style: 'currency', currency: 'RUB', minimumFractionDigits: 2, maximumFractionDigits: 2 })
 const decimal = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 1 })
 let section = 'calculator'
 let inputs = { ...DEFAULT_INPUTS }
@@ -28,8 +28,8 @@ function layout(content) {
   </div>`
 }
 
-function header(eyebrow, title, description, badge = '') {
-  return `<header class="page-header"><div><span class="eyebrow">${eyebrow}</span><div class="title-line"><h1>${title}</h1>${badge ? `<span class="badge">${badge}</span>` : ''}</div><p>${description}</p></div><div class="period"><span>Рабочий период</span><strong>Август 2026 <i>⌄</i></strong></div></header>`
+function header(eyebrow, title, description, badge = '', periodLabel = 'Август 2026') {
+  return `<header class="page-header"><div><span class="eyebrow">${eyebrow}</span><div class="title-line"><h1>${title}</h1>${badge ? `<span class="badge">${badge}</span>` : ''}</div><p>${description}</p></div><div class="period"><span>Рабочий период</span><strong>${escapeHtml(periodLabel)}</strong></div></header>`
 }
 
 function field(key, label, suffix, options = '') {
@@ -76,18 +76,26 @@ function uploadCard(key, index, title, description, schema) {
 }
 
 function pnlPage() {
-  return layout(`${header('Фактические данные', 'Факт P&amp;L Ozon', 'Загрузите два Excel-файла: обработка полностью выполняется в вашем браузере.', 'Локальный импорт')}
-    <div class="period-bar card"><div><label>Отчётный период</label><div class="date-range"><span>01.08.2026</span><i>—</i><span>31.08.2026</span></div></div><div><label>Статус периода</label><div class="segmented">${PERIOD_STATUSES.map(item => `<button data-status="${item}" class="${periodStatus === item ? 'selected' : ''}">${item === 'Закрытый' ? '▣ ' : ''}${item}</button>`).join('')}</div></div><div class="source-pill"><span>Источник данных</span><strong>▤ Excel-отчёт Ozon</strong></div></div>
+  const sourcePeriod = report?.period || 'Будет определён из файла'
+  return layout(`${header('Фактические данные', 'Факт P&amp;L Ozon', 'Загрузите два Excel-файла: обработка полностью выполняется в вашем браузере.', 'Локальный импорт', sourcePeriod)}
+    <div class="period-bar card"><div><label>Отчётный период из первой строки файла</label><div class="date-range"><span>${escapeHtml(sourcePeriod)}</span></div></div><div><label>Статус периода</label><div class="segmented">${PERIOD_STATUSES.map(item => `<button data-status="${item}" class="${periodStatus === item ? 'selected' : ''}">${item === 'Закрытый' ? '▣ ' : ''}${item}</button>`).join('')}</div></div><div class="source-pill"><span>Источник данных</span><strong>▤ Excel-отчёт Ozon</strong></div></div>
     <section class="upload-section"><div class="section-title"><span class="step">01</span><div><h2>Загрузите исходные файлы</h2><p>Реальные данные не сохраняются в репозитории</p></div></div><div class="upload-grid">${uploadCard('ozon', 1, 'Отчёт Ozon по начислениям', 'Основной источник выручки и расходов', OZON_ACCRUALS_SCHEMA)}${uploadCard('cost', 2, 'Справочник себестоимости', 'Сопоставление по артикулу продавца', COST_PRICE_SCHEMA)}</div></section>
     <section class="import-actions"><div><strong>Себестоимость используется без корректировки НДС</strong><span>Берём значение «СЕБЕС (руб)» ровно из справочника.</span></div><button id="run-import" ${files.ozon && files.cost && !fileStates.ozon.loading && !fileStates.cost.loading ? '' : 'disabled'}>Сформировать отчёт</button></section>
     ${importError ? `<div class="global-error" role="alert">⚠ ${escapeHtml(importError)}</div>` : ''}
     ${report ? reportView(report) : ''}`)
 }
 
-function reportView(rows) {
+const SERVICE_GROUPS = ['Возвраты', 'Вознаграждение Ozon', 'Другие услуги и штрафы', 'Продажи', 'Продвижение и реклама', 'Прочие начисления', 'Услуги FBO', 'Услуги агентов', 'Услуги доставки']
+
+function reportView(report) {
+  const { articles: rows, totals } = report
   const missing = rows.filter(row => row.missingCost)
-  return `<section class="report-section"><div class="section-title"><span class="step">02</span><div><h2>Результат по артикулам</h2><p>${rows.length} товаров · ${missing.length} без себестоимости</p></div></div>
-    <div class="report-table card"><table><thead><tr><th>Артикул</th><th>SKU и название</th><th>Количество</th><th>Продажи</th><th>Комиссия Ozon</th><th>Начисления Ozon</th><th>Себестоимость</th><th>Прибыль</th><th>Рентабельность</th><th>Статус</th></tr></thead><tbody>${rows.map(item => `<tr class="${item.missingCost ? 'missing-row' : ''}"><td><strong>${escapeHtml(item.article)}</strong></td><td><strong>${escapeHtml(item.sku || '—')}</strong><small>${escapeHtml(item.name || 'Без названия')}</small></td><td>${decimal.format(item.quantity)}</td><td>${money.format(item.sales)}</td><td>${item.commissionPercent == null ? '—' : `${decimal.format(item.commissionPercent)}%`}</td><td>${money.format(item.accruals)}</td><td>${item.cost == null ? '—' : money.format(item.cost)}</td><td class="${item.profit != null && item.profit >= 0 ? 'profit' : 'loss'}">${item.profit == null ? '—' : money.format(item.profit)}</td><td>${item.profitability == null ? '—' : `${decimal.format(item.profitability)}%`}</td><td><span class="status ${item.missingCost ? 'missing' : 'found'}">${item.missingCost ? '⚠ Не найдена' : '✓ Найдена'}</span></td></tr>`).join('')}</tbody></table></div>
+  const metrics = [['Выручка ВД', totals.revenue], ['Начисления после расходов Ozon', totals.accruals], ['Себестоимость', totals.cost], ['ВП', totals.profit], ['Рентабельность ВП', `${decimal.format(totals.profitability)}%`], ['Выручка без НДС', totals.revenueWithoutVat], ['ВП без НДС', totals.profitWithoutVat]]
+  return `<section class="report-section"><div class="summary-grid">${metrics.map(([label, value]) => `<div class="metric"><span>${label}</span><strong>${typeof value === 'number' ? money.format(value) : value}</strong></div>`).join('')}</div>
+    <div class="section-title"><span class="step">02</span><div><h2>Сводная по группам услуг</h2><p>Все суммы взяты из колонки «Сумма итого, руб.»</p></div></div>
+    <div class="service-summary card">${SERVICE_GROUPS.map(group => `<div><span>${group}</span><strong>${money.format(report.serviceGroups[group] || 0)}</strong></div>`).join('')}<div class="grand-total"><span>Общий итог</span><strong>${money.format(totals.accruals)}</strong></div></div>
+    <div class="section-title article-heading"><span class="step">03</span><div><h2>Результат по артикулам</h2><p>${rows.filter(row => !row.unassigned).length} товаров · ${missing.length} без себестоимости · продано ${decimal.format(totals.quantity)} ед.</p></div></div>
+    <div class="report-table card"><table><thead><tr><th>Артикул</th><th>SKU и название</th><th>Количество</th><th>Выручка ВД</th><th>Вознаграждение Ozon</th><th>Прочие расходы Ozon</th><th>Начисления после расходов Ozon</th><th>Себестоимость</th><th>ВП</th><th>Рентабельность ВП</th><th>Статус</th></tr></thead><tbody>${rows.map(item => `<tr class="${item.missingCost ? 'missing-row' : ''}"><td><strong>${item.unassigned ? '—' : escapeHtml(item.article)}</strong></td><td><strong>${escapeHtml(item.sku || '—')}</strong><small>${escapeHtml(item.name || 'Без названия')}</small></td><td>${decimal.format(item.quantity)}</td><td>${money.format(item.revenue)}</td><td>${money.format(item.ozonReward)}</td><td>${money.format(item.otherOzonExpenses)}</td><td>${money.format(item.accruals)}</td><td>${item.cost == null ? '—' : money.format(item.cost)}</td><td class="${item.profit != null && item.profit >= 0 ? 'profit' : 'loss'}">${item.profit == null ? '—' : money.format(item.profit)}</td><td>${item.profitability == null ? '—' : `${decimal.format(item.profitability)}%`}</td><td>${item.unassigned ? '<span class="status">Не распределяется</span>' : `<span class="status ${item.missingCost ? 'missing' : 'found'}">${item.missingCost ? '⚠ Не найдена' : '✓ Найдена'}</span>`}</td></tr>`).join('')}</tbody></table></div>
     ${missing.length ? `<aside class="missing-list"><h3>Товары без найденной себестоимости</h3><p>Добавьте эти артикулы на лист «OZON» и загрузите справочник повторно.</p><div>${missing.map(item => `<span>${escapeHtml(item.article)}${item.name ? ` · ${escapeHtml(item.name)}` : ''}</span>`).join('')}</div></aside>` : '<div class="all-found">✓ Себестоимость найдена для всех товаров.</div>'}</section>`
 }
 
@@ -120,7 +128,7 @@ function render() {
   root.querySelector('#run-import')?.addEventListener('click', () => {
     try {
       report = buildArticleReport(fileStates.ozon.workbook, fileStates.cost.workbook)
-      importError = report.length ? '' : 'В отчёте нет строк с заполненным артикулом.'
+      importError = report.articles.length ? '' : 'В отчёте нет строк начислений.'
     } catch (error) { report = null; importError = error.message }
     render()
   })
