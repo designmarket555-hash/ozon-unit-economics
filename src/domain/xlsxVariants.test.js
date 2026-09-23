@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { buildArticleReport, readExcelFile, rowsFromSheet } from './importer.js'
-import { OZON_ACCRUALS_SCHEMA } from './importSchema.js'
+import { buildArticleReport, readCostReference, readExcelFile, rowsFromSheet } from './importer.js'
+import { COST_PRICE_SCHEMA, OZON_ACCRUALS_SCHEMA } from './importSchema.js'
 
 const headers = ['ID начисления', 'Дата начисления', 'Группа услуг', 'Тип начисления', 'Артикул', 'SKU', 'Название товара', 'Количество', 'Цена продавца', 'Сумма итого, руб.']
 const encoder = new TextEncoder()
@@ -54,6 +54,15 @@ function zip(files) {
 }
 async function load(options = {}, name = 'любой файл (1).xlsx') { const blob = makeXlsx(options); return readExcelFile({ name, size: blob.size, arrayBuffer: () => blob.arrayBuffer() }) }
 
+function makeCostXlsx(sheet, { sheetName = 'OZON', extras = [] } = {}) {
+  const allSheets = [...extras.map((name, index) => ({ name, id: `extra${index}`, target: `worksheets/extra${index}.xml` })), { name: sheetName, id: 'cost', target: 'worksheets/cost.xml' }]
+  const workbook = `<workbook xmlns:r="relationships"><sheets>${allSheets.map((item, index) => `<sheet name="${item.name}" sheetId="${index + 1}" r:id="${item.id}"/>`).join('')}</sheets></workbook>`
+  const rels = `<Relationships>${allSheets.map(item => `<Relationship Id="${item.id}" Target="${item.target}"/>`).join('')}</Relationships>`
+  return zip({ 'xl/workbook.xml': workbook, 'xl/_rels/workbook.xml.rels': rels, 'xl/worksheets/cost.xml': `<worksheet><sheetData>${sheet}</sheetData></worksheet>`, ...Object.fromEntries(extras.map((_, index) => [`xl/worksheets/extra${index}.xml`, '<worksheet><sheetData><row><c t="str"><v>другой лист</v></c></row></sheetData></worksheet>'])) })
+}
+async function loadCost(sheet, options, name = 'OZON WB Себес и маржа 14.09 (1).xlsx') { const blob = makeCostXlsx(sheet, options); return readExcelFile({ name, size: blob.size, arrayBuffer: () => blob.arrayBuffer() }) }
+const costHeader = (row = 6, reversed = false, label = 'СЕБЕС (руб)') => `<row r="${row}">${reversed ? `<c r="B${row}" t="str"><v>${label}</v></c><c r="D${row}" t="str"><v>АРТИКУЛ</v></c>` : `<c r="A${row}" t="str"><v>АРТИКУЛ</v></c><c r="F${row}" t="str"><v>${label}</v></c>`}</row>`
+
 describe('real Ozon XLSX structures', () => {
   it('reads a normal one-sheet workbook whose filename contains spaces and (1)', async () => assert.equal(rowsFromSheet(await load(), OZON_ACCRUALS_SCHEMA).length, 1))
   it('decodes a sheet name made from numeric XML entities', async () => assert.ok((await load({ entityName: true })).Начисления))
@@ -69,5 +78,40 @@ describe('real Ozon XLSX structures', () => {
     const costs = { OZON: [['АРТИКУЛ', 'СЕБЕС (руб)'], ['ART', 1]] }
     const report = buildArticleReport(accruals, costs)
     assert.equal(report.serviceGroups['Совершенно новая услуга'], -42); assert.equal(report.totals.accruals, -42); assert.match(report.warnings.join(' '), /Совершенно новая услуга/); assert.match(report.warnings.join(' '), /Новый тип/); assert.deepEqual(report.newCategoryDetails, [{ label: 'Совершенно новая услуга — Новый тип', amount: -42 }])
+  })
+})
+
+describe('cost reference XLSX regression cases', () => {
+  it('skips an empty article row even when it contains t="e" cells', async () => {
+    const book = await loadCost(`${costHeader()}<row r="8"><c r="D8" t="e"><v>#N/A</v></c><c r="F8" t="e"><v>#N/A</v></c></row><row r="9"><c r="A9" t="str"><v>OK</v></c><c r="F9"><v>10</v></c></row>`)
+    const result = readCostReference(book); assert.equal(result.costs.get('OK'), 10); assert.equal(result.summary.skippedEmptyRows, 1); assert.equal(result.issues.length, 0)
+  })
+  it('ignores t="e" in an unneeded column', async () => {
+    const result = readCostReference(await loadCost(`${costHeader()}<row r="8"><c r="A8" t="str"><v>OK</v></c><c r="D8" t="e"><v>#N/A</v></c><c r="F8"><v>20</v></c></row>`)); assert.equal(result.costs.get('OK'), 20)
+  })
+  it('reports an article whose cost is #N/A with its cell address', async () => {
+    const result = readCostReference(await loadCost(`${costHeader()}<row r="8"><c r="A8" t="str"><v>BAD</v></c><c r="F8" t="e"><v>#N/A</v></c></row>`)); assert.deepEqual(result.issues, [{ article: 'BAD', address: 'F8', error: '#N/A' }]); assert.equal(result.costs.has('BAD'), false)
+  })
+  it('uses the cached numeric value of a formula', async () => {
+    const result = readCostReference(await loadCost(`${costHeader()}<row r="8"><c r="A8" t="str"><v>FORMULA</v></c><c r="F8"><f>VLOOKUP(A8,A:B,2,0)</f><v>720</v></c></row>`)); assert.equal(result.costs.get('FORMULA'), 720)
+  })
+  it('finds headers outside row 6 and normalizes whitespace and case', async () => {
+    const result = readCostReference(await loadCost(`${costHeader(17, false, 'Себестоимость, руб.')}<row r="18"><c r="A18" t="str"><v> A-Б </v></c><c r="F18"><v>42</v></c></row>`)); assert.equal(result.summary.headerRow, 17); assert.equal(result.costs.get('A-Б'), 42)
+  })
+  it('maps article and cost columns after they are reordered', async () => {
+    const result = readCostReference(await loadCost(`${costHeader(4, true)}<row r="5"><c r="B5"><v>99</v></c><c r="D5" t="str"><v>SWAP</v></c></row>`)); assert.equal(result.costs.get('SWAP'), 99)
+  })
+  it('does not depend on a filename containing spaces and (1)', async () => {
+    const book = await loadCost(`${costHeader()}<row r="7"><c r="A7" t="str"><v>NAME</v></c><c r="F7"><v>1</v></c></row>`, {}, 'любой справочник (1).xlsx'); assert.equal(readCostReference(book).costs.get('NAME'), 1)
+  })
+  it('prefers OZON among WB, Calculator, and other sheets', async () => {
+    const result = readCostReference(await loadCost(`${costHeader()}<row r="7"><c r="A7" t="str"><v>MULTI</v></c><c r="F7"><v>2</v></c></row>`, { extras: ['WB', 'Калькулятор', 'Другое'] })); assert.equal(result.summary.sheetName, 'OZON')
+  })
+  it('continues to import the old valid layout', async () => {
+    const book = await loadCost(`${costHeader()}<row r="7"><c r="A7" t="str"><v>OLD</v></c><c r="F7"><v>300</v></c></row>`); assert.equal(rowsFromSheet(book, COST_PRICE_SCHEMA)[0].АРТИКУЛ, 'OLD'); assert.equal(readCostReference(book).costs.get('OLD'), 300)
+  })
+  it('accepts t="e" without the unsupported-cell-type error and exposes conflicts', async () => {
+    const book = await loadCost(`${costHeader()}<row r="7"><c r="A7" t="str"><v>DUP</v></c><c r="F7"><v>10</v></c></row><row r="8"><c r="A8" t="str"><v>DUP</v></c><c r="F8"><v>11</v></c><c r="G8" t="e"><v>#N/A</v></c></row>`)
+    const result = readCostReference(book); assert.equal(result.conflicts.length, 1); assert.doesNotMatch(JSON.stringify(result), /Неподдерживаемый тип ячейки/)
   })
 })
