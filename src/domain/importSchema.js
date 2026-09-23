@@ -1,8 +1,6 @@
 export const OZON_ACCRUALS_SCHEMA = {
   sourceName: 'Excel-отчёт Ozon',
   sheet: 'Начисления',
-  headerRow: 2,
-  ignoredSheets: ['Начисления (2)'],
   fields: ['ID начисления', 'Дата начисления', 'Группа услуг', 'Тип начисления', 'Артикул', 'SKU', 'Название товара', 'Количество', 'Цена продавца', 'Сумма итого, руб.'],
   optionalFields: ['Комиссия Ozon, %'],
 }
