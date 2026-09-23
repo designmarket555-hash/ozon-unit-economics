@@ -70,8 +70,8 @@ describe('Excel import domain', () => {
     assert.ok(Math.abs(totals.profitWithoutVat - 285854.36) < 0.01)
   })
 
-  it('reports a missing sheet and missing columns clearly', () => {
-    assert.throws(() => rowsFromSheet({}, OZON_ACCRUALS_SCHEMA), error => error instanceof ImportError && error.code === 'MISSING_SHEET')
+  it('reports a missing table and missing columns clearly', () => {
+    assert.throws(() => rowsFromSheet({}, OZON_ACCRUALS_SCHEMA), error => error instanceof ImportError && error.code === 'EMPTY_FILE')
     assert.throws(() => rowsFromSheet({ Начисления: [[], ['Артикул'], ['TEST']] }, OZON_ACCRUALS_SCHEMA), error => error.code === 'MISSING_COLUMNS' && error.message.includes('ID начисления'))
     assert.throws(() => rowsFromSheet({ Начисления: [[], accrualHeaders.filter(header => header !== 'Сумма итого, руб.'), ['TEST']] }, OZON_ACCRUALS_SCHEMA), error => error.code === 'MISSING_COLUMNS' && error.message.includes('Сумма итого, руб.'))
   })
