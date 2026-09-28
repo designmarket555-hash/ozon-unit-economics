@@ -1,11 +1,11 @@
 import { COST_PRICE_SCHEMA, OZON_ACCRUALS_SCHEMA } from './importSchema.js'
+import { EXPENSE_CATEGORIES, FINANCE_CONFIG } from './financeConfig.js'
 
 export class ImportError extends Error {
   constructor(message, code = 'INVALID_FILE') { super(message); this.name = 'ImportError'; this.code = code }
 }
 
-const KNOWN_GROUPS = new Set(['Возвраты', 'Вознаграждение Ozon', 'Другие услуги и штрафы', 'Продажи', 'Продвижение и реклама', 'Прочие начисления', 'Услуги FBO', 'Услуги агентов', 'Услуги доставки'])
-const KNOWN_TYPES = new Set(['Выручка', 'Баллы за скидки', 'Комиссия', 'Доставка'])
+const SALE = 'продажи', RETURN = 'возвраты'
 
 export async function readExcelFile(file) {
   if (!file) throw new ImportError('Выберите файл Excel в формате .xlsx.', 'INVALID_FILE')
@@ -61,40 +61,104 @@ export function buildArticleReport(accrualWorkbook, costWorkbook) {
   const accruals = rowsFromSheet(accrualWorkbook, OZON_ACCRUALS_SCHEMA)
   const costReference = readCostReference(costWorkbook)
   const costByArticle = costReference.costs
-  const result = new Map(), serviceGroups = new Map(), unknownGroups = new Set(), unknownTypes = new Set(), categoryAmounts = new Map()
-  for (const row of accruals) {
+  const result = new Map(), serviceGroups = new Map(), categoryAmounts = new Map(), unknownCategories = new Map()
+  const expenseCategories = Object.fromEntries(EXPENSE_CATEGORIES.map(([key]) => [key, 0]))
+  const seen = new Set(), duplicateIds = []
+  let financialTotal = 0
+  for (const [rowIndex, row] of accruals.entries()) {
+    const id = cleanText(value(row, 'ID начисления'))
+    const identity = id || `row:${rowIndex}`
+    if (seen.has(identity)) { duplicateIds.push(identity); continue }
+    seen.add(identity)
     const article = normalizeArticle(value(row, 'Артикул'))
     const amount = number(value(row, 'Сумма итого, руб.'))
     const group = cleanText(value(row, 'Группа услуг'))
     const type = cleanText(value(row, 'Тип начисления'))
+    financialTotal += amount
     serviceGroups.set(group, (serviceGroups.get(group) || 0) + amount)
-    if (group && !KNOWN_GROUPS.has(group)) unknownGroups.add(group)
-    if (type && !KNOWN_TYPES.has(type)) unknownTypes.add(type)
     categoryAmounts.set(`${group} — ${type}`, (categoryAmounts.get(`${group} — ${type}`) || 0) + amount)
     const key = article || '0'
-    const item = result.get(key) || { article: key, sku: '', name: '', quantity: 0, revenue: 0, ozonReward: 0, otherOzonExpenses: 0, accruals: 0 }
+    const item = result.get(key) || emptyArticle(key)
     item.sku ||= cleanText(value(row, 'SKU')); item.name ||= cleanText(value(row, 'Название товара'))
-    if (equalText(group, 'Продажи') && equalText(type, 'Выручка')) item.quantity += number(value(row, 'Количество'))
-    if (equalText(group, 'Продажи')) item.revenue += amount
-    else if (equalText(group, 'Вознаграждение Ozon')) item.ozonReward += amount
-    else item.otherOzonExpenses += amount
-    item.accruals += amount; result.set(key, item)
+    const normalizedGroup = normalizeText(group), normalizedType = normalizeText(type)
+    const quantity = Math.abs(number(value(row, 'Количество')))
+    if (normalizedGroup === SALE && normalizedType === 'выручка') {
+      item.soldQuantity += quantity; item.salesGross += Math.abs(amount); item.statementAmount += amount
+    } else if (normalizedGroup === RETURN && (normalizedType === 'выручка' || /return|возврат/.test(normalizedType))) {
+      item.returnedQuantity += quantity; item.returnsGross += Math.abs(amount); item.statementAmount += amount
+    } else {
+      const kind = operationKind(normalizedGroup, normalizedType)
+      if (kind === 'income') item.compensations += amount
+      else {
+        const category = expenseCategory(normalizedGroup, normalizedType)
+        const expense = -amount
+        item.expenseCategories[category] += expense; item.ozonExpenses += expense
+        expenseCategories[category] += expense
+        if (category === 'advertising' || category === 'marketing') item.advertising += expense
+        if (category === 'unknown') unknownCategories.set(`${group} — ${type}`, (unknownCategories.get(`${group} — ${type}`) || 0) + amount)
+      }
+      item.statementAmount += amount
+    }
+    result.set(key, item)
   }
   const articles = [...result.values()].map(item => {
-    if (item.article === '0') return { ...item, name: 'Общие расходы без артикула', cost: null, profit: null, profitability: null, missingCost: false, unassigned: true }
-    const hasCost = costByArticle.has(item.article), cost = hasCost ? costByArticle.get(item.article) * item.quantity : null
-    const profit = hasCost ? item.accruals - cost : null
-    return { ...item, cost, profit, profitability: hasCost && item.revenue ? profit / item.revenue * 100 : null, missingCost: !hasCost, unassigned: false }
+    const netQuantity = item.soldQuantity - item.returnedQuantity
+    const netRevenueGross = item.salesGross - item.returnsGross
+    const vat = netRevenueGross * FINANCE_CONFIG.vatRatePercent / (100 + FINANCE_CONFIG.vatRatePercent)
+    const netRevenue = netRevenueGross - vat
+    if (item.article === '0') return { ...item, name: 'Расходы без артикула', netQuantity, netRevenueGross, vat, netRevenue, cost: null, grossProfit: null, marginalProfit: item.compensations - item.ozonExpenses, marginalProfitability: null, missingCost: false, unassigned: true }
+    const hasSales = item.soldQuantity > 0 || item.returnedQuantity > 0
+    const hasCost = !hasSales || costByArticle.has(item.article)
+    const cost = hasCost ? (costByArticle.get(item.article) || 0) * netQuantity : null
+    const grossProfit = hasCost ? netRevenue - cost : null
+    const marginalProfit = hasCost ? grossProfit - item.ozonExpenses + item.compensations : null
+    return { ...item, netQuantity, netRevenueGross, vat, netRevenue, cost, grossProfit, marginalProfit, marginalProfitability: hasCost && netRevenue ? marginalProfit / netRevenue * 100 : null, missingCost: !hasCost, unassigned: false }
   }).sort((a, b) => a.article.localeCompare(b.article, 'ru', { numeric: true }))
-  const revenue = [...serviceGroups].filter(([group]) => equalText(group, 'Продажи')).reduce((sum, [, amount]) => sum + amount, 0)
-  const accrualsTotal = [...serviceGroups.values()].reduce((sum, amount) => sum + amount, 0)
-  const cost = articles.reduce((sum, item) => sum + (item.cost || 0), 0), profit = accrualsTotal - cost
-  const warnings = [...unknownGroups].map(group => `Обнаружена новая группа услуг Ozon: «${group}». Сумма включена в общий итог.`)
-  warnings.push(...[...unknownTypes].map(type => `Обнаружен новый тип начисления Ozon: «${type}». Сумма включена в общий итог.`))
-  const newCategoryDetails = [...categoryAmounts].filter(([label]) => [...unknownGroups].some(group => label.startsWith(`${group} —`)) || [...unknownTypes].some(type => label.endsWith(`— ${type}`))).map(([label, amount]) => ({ label, amount }))
+  const sum = field => articles.reduce((total, item) => total + (item[field] || 0), 0)
+  const salesGross = sum('salesGross'), returnsGross = sum('returnsGross'), netRevenueGross = salesGross - returnsGross
+  const vat = netRevenueGross * FINANCE_CONFIG.vatRatePercent / (100 + FINANCE_CONFIG.vatRatePercent), netRevenue = netRevenueGross - vat
+  const knownCost = sum('cost'), ozonExpenses = sum('ozonExpenses'), compensations = sum('compensations')
+  const complete = articles.every(item => !item.missingCost), grossProfit = complete ? netRevenue - knownCost : null
+  const marginalProfit = complete ? grossProfit - ozonExpenses + compensations : null
+  const warnings = [...unknownCategories].map(([label]) => `Обнаружена новая категория Ozon: «${label}». Сумма сохранена и включена один раз.`)
+  if (duplicateIds.length) warnings.push(`Исключены дублирующиеся строки: ${duplicateIds.join(', ')}.`)
   warnings.push(...costReference.conflicts.map(item => `Конфликт себестоимости для артикула «${item.article}»: ${item.values.join(' и ')} (${item.address}).`))
-  return { period: extractPeriod(accrualTable.sheet, accrualTable.headerIndex), serviceGroups: Object.fromEntries(serviceGroups), unknownGroups: [...unknownGroups], unknownTypes: [...unknownTypes], newCategoryDetails, warnings, costImport: { ...costReference.summary, issues: costReference.issues, conflicts: costReference.conflicts }, totals: { quantity: articles.reduce((sum, item) => sum + item.quantity, 0), revenue, accruals: accrualsTotal, cost, profit, profitability: revenue ? profit / revenue * 100 : 0, revenueWithoutVat: revenue / 1.22, profitWithoutVat: profit / 1.22 }, articles }
+  const salesWithCost = articles.filter(item => !item.unassigned && !item.missingCost).reduce((total, item) => total + item.salesGross, 0)
+  const unassigned = articles.find(item => item.unassigned)?.marginalProfit || 0
+  const skuMargin = articles.filter(item => !item.unassigned).reduce((total, item) => total + (item.marginalProfit || 0), 0)
+  const checks = {
+    categoriesEqualStatement: close([...serviceGroups.values()].reduce((a, b) => a + b, 0), financialTotal),
+    salesMinusReturns: close(salesGross - returnsGross, netRevenueGross),
+    expensesEqualCategories: close(Object.values(expenseCategories).reduce((a, b) => a + b, 0), ozonExpenses),
+    skuPlusUnassigned: !complete || close(skuMargin + unassigned, marginalProfit),
+    noDuplicateRows: duplicateIds.length === 0,
+    missingCostNotZero: articles.filter(item => item.missingCost).every(item => item.cost === null),
+    unknownCategoriesKept: close(expenseCategories.unknown, -[...unknownCategories.values()].reduce((a, b) => a + b, 0)),
+  }
+  const newCategoryDetails = [...unknownCategories].map(([label, amount]) => ({ label, amount }))
+  return { period: extractPeriod(accrualTable.sheet, accrualTable.headerIndex), vatRatePercent: FINANCE_CONFIG.vatRatePercent, serviceGroups: Object.fromEntries(serviceGroups), expenseCategories, unknownCategories: newCategoryDetails, newCategoryDetails, warnings, checks, costImport: { ...costReference.summary, issues: costReference.issues, conflicts: costReference.conflicts }, totals: { soldQuantity: sum('soldQuantity'), returnedQuantity: sum('returnedQuantity'), netQuantity: sum('netQuantity'), salesGross, returnsGross, netRevenueGross, vat, netRevenue, cost: complete ? knownCost : null, knownCost, grossProfit, grossMargin: grossProfit != null && netRevenue ? grossProfit / netRevenue * 100 : null, ozonExpenses, advertising: articles.reduce((total, item) => total + item.advertising, 0), compensations, marginalProfit, marginalMargin: marginalProfit != null && netRevenue ? marginalProfit / netRevenue * 100 : null, accruals: financialTotal, complete, costCoveragePercent: salesGross ? salesWithCost / salesGross * 100 : 100, unassignedImpact: unassigned }, articles }
 }
+
+function emptyArticle(article) { return { article, sku: '', name: '', soldQuantity: 0, returnedQuantity: 0, salesGross: 0, returnsGross: 0, ozonExpenses: 0, advertising: 0, compensations: 0, statementAmount: 0, expenseCategories: Object.fromEntries(EXPENSE_CATEGORIES.map(([key]) => [key, 0])) } }
+function operationKind(group, type) { return group === SALE || /compens|income|компенсац|прочие начислен|доход|балл.*скидк/.test(`${group} ${type}`) ? 'income' : 'expense' }
+function expenseCategory(group, type) {
+  const text = `${group} ${type}`
+  if (/комисс|вознагражден/.test(text)) return 'commission'
+  if (/эквайр/.test(text)) return 'acquiring'
+  if (/обратн.*логист/.test(text)) return 'reverseLogistics'
+  if (/обработ.*возврат/.test(text)) return 'returnProcessing'
+  if (/последн.*мил/.test(text)) return 'lastMile'
+  if (/приемк|приёмк/.test(text)) return 'acceptance'
+  if (/хранен|размещен/.test(text)) return 'storageFbo'
+  if (/fbs/.test(text)) return 'fbs'
+  if (/агент|партнер|партнёр/.test(text)) return 'partners'
+  if (/продвиж|реклам/.test(text)) return 'advertising'
+  if (/premium|отзыв|маркетинг/.test(text)) return 'marketing'
+  if (/достав|логист/.test(text)) return 'delivery'
+  if (/штраф|другие услуги|прочие услуги|fbo/.test(text)) return 'penalties'
+  return 'unknown'
+}
+function close(a, b) { return Math.abs(a - b) < 0.005 }
 
 function locateTable(workbook, schema) {
   if (!workbook || typeof workbook !== 'object') throw new ImportError('Книга Excel не содержит листов.', 'EMPTY_FILE')
